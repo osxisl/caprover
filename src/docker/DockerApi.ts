@@ -30,33 +30,117 @@ import dockerodeUtils = require('dockerode/lib/util')
 const Base64 = Base64Provider.Base64
 const CAPROVER_MANAGED_SERVICE_LABEL = 'com.caprover.managed'
 
+let chunkBuffer = ''
+
+function extractProtobufStrings(buffer: Buffer): string[] {
+    const strings: string[] = []
+    let offset = 0
+
+    while (offset < buffer.length) {
+        const tag = buffer[offset++]
+        const wireType = tag & 7
+
+        if (wireType === 0) {
+            // Varint (integers / booleans): skip bytes
+            while (offset < buffer.length && buffer[offset++] & 0x80) {}
+        } else if (wireType === 1) {
+            // 64-bit fixed (timestamps): skip 8 bytes
+            offset += 8
+        } else if (wireType === 5) {
+            // 32-bit fixed: skip 4 bytes
+            offset += 4
+        } else if (wireType === 2) {
+            // Length-delimited (Strings, Sub-messages, Logs)
+            let length = 0
+            let shift = 0
+            while (offset < buffer.length) {
+                const b = buffer[offset++]
+                length |= (b & 0x7f) << shift
+                if (!(b & 0x80)) break
+                shift += 7
+            }
+
+            if (offset + length > buffer.length || length <= 0) break
+
+            const slice = buffer.slice(offset, offset + length)
+            offset += length
+
+            const str = slice.toString('utf8')
+
+            // Allow all readable text and emojis, reject binary control bytes
+            if (
+                str.length > 0 &&
+                !/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F\uFFFD]/.test(str)
+            ) {
+                const trimmed = str.trim()
+                // Filter out internal layer hashes, BuildKit internal metadata keys, and single-letter tags
+                if (
+                    trimmed.length > 1 &&
+                    !/sha256:[a-f0-9]{64}/i.test(trimmed) &&
+                    !trimmed.startsWith('llb.') &&
+                    !trimmed.startsWith('containerimage.')
+                ) {
+                    strings.push(trimmed)
+                }
+            } else {
+                // If it's a nested Protobuf sub-message, recurse into it
+                const subStrings = extractProtobufStrings(slice)
+                if (subStrings.length > 0) {
+                    strings.push(...subStrings)
+                }
+            }
+        } else {
+            break // Unknown wire type
+        }
+    }
+
+    return strings
+}
+
 function safeParseChunk(chunk: string): {
     stream?: string
     error?: any
     errorDetail?: any
 }[] {
-    chunk = `${chunk}`.trim()
-    try {
-        // See https://github.com/caprover/caprover/issues/570
-        // This appears to be bug either in Docker or dockerone:
-        // Sometimes chunk appears as two JSON objects, like
-        // ```
-        // {"stream":"something......"}
-        // {"stream":"another line of things"}
-        // ```
-        const chunks = chunk.split('\n')
-        const returnVal = [] as any[]
-        chunks.forEach((chk) => {
-            returnVal.push(JSON.parse(chk))
-        })
-        return returnVal
-    } catch (ignore) {
-        return [
-            {
-                stream: `Cannot parse ${chunk}`,
-            },
-        ]
-    }
+    // See https://github.com/caprover/caprover/issues/570
+    // This appears to be bug either in Docker or dockerone:
+    // Sometimes chunk appears as two JSON objects, or is split across TCP packets.
+    // We buffer chunks and split by newline to ensure complete NDJSON lines are parsed.
+    chunkBuffer += `${chunk}`
+    const chunks = chunkBuffer.split('\n')
+    chunkBuffer = chunks.pop() || ''
+
+    const returnVal = [] as any[]
+
+    chunks.forEach((chk) => {
+        const trimmed = chk.trim()
+        if (!trimmed) return
+
+        try {
+            const parsed = JSON.parse(trimmed)
+
+            // Modern BuildKit support: decode Protobuf binary trace packets into readable text
+            if (parsed.aux && !parsed.stream) {
+                try {
+                    const buffer = Buffer.from(parsed.aux, 'base64')
+                    const extracted = extractProtobufStrings(buffer)
+                    if (extracted.length > 0) {
+                        parsed.stream = extracted.join('\n') + '\n'
+                    }
+                } catch (e) {
+                    // Safe fallback
+                }
+            }
+
+            returnVal.push(parsed)
+        } catch (ignore) {
+            returnVal.push({
+                stream: `Cannot parse ${trimmed}\n`,
+            })
+        }
+    })
+
+    return returnVal
 }
 
 export abstract class IDockerUpdateOrders {
